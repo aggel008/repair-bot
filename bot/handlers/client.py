@@ -1,14 +1,16 @@
+import logging
 import re
+
 from aiogram import Router, F
 from aiogram.types import Message
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 
-from bot.config import MASTER_CHAT_ID, DEVICE_LABELS
+from bot.config import DEVICE_LABELS
 from bot.states.order import OrderForm
 from bot.keyboards.builder import device_keyboard, confirm_keyboard, remove_keyboard
 from bot.database.repository import create_order
-from bot.handlers.master import notify_master
+from bot.services.notification import notify_master_new_order
 
 router = Router()
 
@@ -129,16 +131,21 @@ async def handle_confirm(message: Message, state: FSMContext) -> None:
         reply_markup=remove_keyboard(),
     )
 
-    await notify_master(
+    notified = await notify_master_new_order(
         bot=message.bot,
         order_id=order_id,
-        device_label=DEVICE_LABELS[data["device"]],
+        device_type=data["device"],
         problem=data["problem"],
         voice_id=data.get("voice_id"),
         phone=data["phone"],
         user_id=message.from_user.id,
         username=message.from_user.username,
     )
+    if not notified:
+        # Заявка сохранена, но мастер не получил уведомление — не теряем её
+        logging.getLogger(__name__).error(
+            "Заявка #%s сохранена, но мастер не уведомлён", order_id
+        )
 
 
 @router.message(OrderForm.confirm, F.text == "Отмена")
@@ -153,3 +160,12 @@ async def handle_cancel(message: Message, state: FSMContext) -> None:
 @router.message(OrderForm.confirm)
 async def handle_confirm_invalid(message: Message) -> None:
     await message.answer('Нажмите "Подтвердить" или "Отмена".')
+
+
+@router.message()
+async def fallback(message: Message) -> None:
+    """Сообщение вне любого FSM-состояния — подсказываем, что делать."""
+    await message.answer(
+        "Чтобы создать заявку — /start.\n"
+        "Список команд — /help."
+    )
