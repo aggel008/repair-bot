@@ -1,14 +1,41 @@
 """Сервис уведомлений: общается с мастером и клиентом, не зависит от хендлеров."""
+import asyncio
 import logging
-from typing import Optional
+from typing import Awaitable, Callable, Optional, TypeVar
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNetworkError
 
 from bot.config import MASTER_CHAT_ID, DEVICE_LABELS
 from bot.keyboards.inline import order_action_keyboard
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+
+async def _with_retry(
+    op: Callable[[], Awaitable[T]],
+    attempts: int = 3,
+    base_delay: float = 1.0,
+) -> T:
+    """Exponential backoff для Telegram API.
+
+    Уважает Retry-After из 429. Сетевые/5xx — три попытки.
+    Финальная ошибка пробрасывается наверх.
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            return await op()
+        except TelegramRetryAfter as e:
+            last_exc = e
+            await asyncio.sleep(e.retry_after)
+        except TelegramNetworkError as e:
+            last_exc = e
+            await asyncio.sleep(base_delay * (2 ** attempt))
+    assert last_exc is not None
+    raise last_exc
 
 
 async def notify_master_new_order(
@@ -37,17 +64,17 @@ async def notify_master_new_order(
     )
 
     try:
-        await bot.send_message(
+        await _with_retry(lambda: bot.send_message(
             chat_id=MASTER_CHAT_ID,
             text=text,
             reply_markup=order_action_keyboard(order_id),
-        )
+        ))
         if voice_id:
-            await bot.send_voice(
+            await _with_retry(lambda: bot.send_voice(
                 chat_id=MASTER_CHAT_ID,
                 voice=voice_id,
                 caption=f"🎤 Голосовое к заявке #{order_id}",
-            )
+            ))
         return True
     except TelegramAPIError:
         logger.exception("Не удалось уведомить мастера о заявке #%s", order_id)
@@ -67,11 +94,11 @@ async def forward_client_message_to_master(
         f"💬 Сообщение по заявке #{order_id} от {client_ref}:\n\n{text}"
     )
     try:
-        await bot.send_message(
+        await _with_retry(lambda: bot.send_message(
             chat_id=MASTER_CHAT_ID,
             text=body,
             reply_markup=order_action_keyboard(order_id),
-        )
+        ))
     except TelegramAPIError:
         logger.exception("Не удалось переслать сообщение клиента по заявке #%s", order_id)
 

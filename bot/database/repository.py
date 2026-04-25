@@ -37,6 +37,27 @@ async def create_order(
         return cursor.lastrowid
 
 
+async def find_recent_duplicate(
+    user_id: int, device_type: str, problem: str, phone: str, window_sec: int = 60
+) -> Optional[int]:
+    """Ищет недавнюю идентичную заявку клиента — защита от двойного клика «Подтвердить».
+
+    Возвращает id заявки или None.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            f"""
+            SELECT id FROM orders
+            WHERE user_id = ? AND device_type = ? AND problem = ? AND phone = ?
+              AND created_at >= datetime('now', '-{int(window_sec)} seconds')
+            ORDER BY id DESC LIMIT 1
+            """,
+            (user_id, device_type, problem, phone),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
 async def get_order(order_id: int) -> Optional[Order]:
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row

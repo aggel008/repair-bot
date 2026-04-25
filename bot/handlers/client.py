@@ -13,7 +13,11 @@ from bot.keyboards.builder import (
     confirm_keyboard,
     remove_keyboard,
 )
-from bot.database.repository import create_order, get_latest_open_order_by_user
+from bot.database.repository import (
+    create_order,
+    find_recent_duplicate,
+    get_latest_open_order_by_user,
+)
 from bot.services.notification import (
     notify_master_new_order,
     forward_client_message_to_master,
@@ -154,6 +158,20 @@ async def _ask_confirmation(message: Message, state: FSMContext, phone: str) -> 
 async def handle_confirm(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     await state.clear()
+
+    # Idempotency: если за последние 60 сек уже есть идентичная заявка — не дублируем
+    duplicate_id = await find_recent_duplicate(
+        user_id=message.from_user.id,
+        device_type=data["device"],
+        problem=data["problem"],
+        phone=data["phone"],
+    )
+    if duplicate_id is not None:
+        await message.answer(
+            f"Заявка №{duplicate_id} уже создана. Мастер свяжется с вами.",
+            reply_markup=remove_keyboard(),
+        )
+        return
 
     order_id = await create_order(
         user_id=message.from_user.id,
