@@ -11,9 +11,12 @@ from bot.keyboards.builder import (
     device_keyboard,
     phone_keyboard,
     confirm_keyboard,
+    photos_skip_keyboard,
+    photos_done_keyboard,
     remove_keyboard,
 )
 from bot.database.repository import (
+    add_order_photo,
     create_order,
     find_recent_duplicate,
     get_latest_open_order_by_user,
@@ -80,12 +83,12 @@ async def handle_problem_text(message: Message, state: FSMContext) -> None:
             "Опишите чуть подробнее — что не работает и когда началось."
         )
         return
-    await state.update_data(problem=text, voice_id=None)
+    await state.update_data(problem=text, voice_id=None, photo_ids=[])
     await message.answer(
-        "Как с вами связаться? Нажмите кнопку или введите номер вручную.",
-        reply_markup=phone_keyboard(),
+        "Если есть фото поломки — пришлите. Можно несколько.",
+        reply_markup=photos_skip_keyboard(),
     )
-    await state.set_state(OrderForm.phone)
+    await state.set_state(OrderForm.photos)
 
 
 @router.message(OrderForm.problem, F.voice)
@@ -93,17 +96,50 @@ async def handle_problem_voice(message: Message, state: FSMContext) -> None:
     await state.update_data(
         problem="[голосовое сообщение]",
         voice_id=message.voice.file_id,
+        photo_ids=[],
     )
     await message.answer(
-        "Голосовое принято. Как с вами связаться?",
-        reply_markup=phone_keyboard(),
+        "Голосовое принято. Если есть фото поломки — пришлите. Можно несколько.",
+        reply_markup=photos_skip_keyboard(),
     )
-    await state.set_state(OrderForm.phone)
+    await state.set_state(OrderForm.photos)
 
 
 @router.message(OrderForm.problem)
 async def handle_problem_invalid(message: Message) -> None:
     await message.answer("Отправьте текст или голосовое с описанием проблемы.")
+
+
+# --- Шаг 2.5: фото (опционально) ---
+
+@router.message(OrderForm.photos, F.photo)
+async def handle_photo(message: Message, state: FSMContext) -> None:
+    """Принимаем фото. Telegram присылает массив размеров — берём максимальный."""
+    data = await state.get_data()
+    photos: list[str] = list(data.get("photo_ids") or [])
+    file_id = message.photo[-1].file_id  # самый большой размер
+    photos.append(file_id)
+    await state.update_data(photo_ids=photos)
+    await message.answer(
+        f"Фото принято ({len(photos)}). Прикрепите ещё или нажмите «Готово».",
+        reply_markup=photos_done_keyboard(),
+    )
+
+
+@router.message(OrderForm.photos, F.text.in_({"📎 Без фото", "✅ Готово"}))
+async def handle_photos_done(message: Message, state: FSMContext) -> None:
+    await message.answer(
+        "Как с вами связаться? Нажмите кнопку или введите номер вручную.",
+        reply_markup=phone_keyboard(),
+    )
+    await state.set_state(OrderForm.phone)
+
+
+@router.message(OrderForm.photos)
+async def handle_photos_invalid(message: Message) -> None:
+    await message.answer(
+        'Отправьте фото или нажмите «Готово» / «Без фото».'
+    )
 
 
 # --- Шаг 3: телефон ---
@@ -140,11 +176,13 @@ async def _ask_confirmation(message: Message, state: FSMContext, phone: str) -> 
 
     device_label = DEVICE_LABELS[data["device"]]
     voice_mark = " (+ голосовое)" if data.get("voice_id") else ""
+    photos_count = len(data.get("photo_ids") or [])
+    photos_mark = f"\nФото: {photos_count}" if photos_count else ""
 
     summary = (
         f"Проверьте заявку:\n\n"
         f"Устройство: {device_label}\n"
-        f"Проблема: {data['problem']}{voice_mark}\n"
+        f"Проблема: {data['problem']}{voice_mark}{photos_mark}\n"
         f"Телефон: {phone}"
     )
     await message.answer(
@@ -183,6 +221,9 @@ async def handle_confirm(message: Message, state: FSMContext) -> None:
         phone=data["phone"],
         voice_id=data.get("voice_id"),
     )
+    photo_ids: list[str] = data.get("photo_ids") or []
+    for fid in photo_ids:
+        await add_order_photo(order_id, fid)
 
     await message.answer(
         f"Заявка №{order_id} принята.\n"
@@ -199,6 +240,7 @@ async def handle_confirm(message: Message, state: FSMContext) -> None:
         phone=data["phone"],
         user_id=message.from_user.id,
         username=message.from_user.username,
+        photo_ids=photo_ids,
     )
     if not notified:
         logger.error("Заявка #%s сохранена, но мастер не уведомлён", order_id)
@@ -255,6 +297,45 @@ async def fallback_text(message: Message) -> None:
         tg_msg_id=message.message_id,
     )
     await message.answer("Сообщение передано мастеру.")
+
+
+@router.message(F.photo)
+async def fallback_photo(message: Message) -> None:
+    """Клиент шлёт фото вне FSM — добавляем к открытой заявке + пересылаем мастеру."""
+    order = await get_latest_open_order_by_user(message.from_user.id)
+    if order is None:
+        await message.answer(
+            "Сначала создайте заявку через /start, потом сможете присылать фото."
+        )
+        return
+
+    file_id = message.photo[-1].file_id
+    await add_order_photo(order.id, file_id)
+    await log_message(
+        order_id=order.id,
+        direction="client_to_master",
+        photo_id=file_id,
+        tg_msg_id=message.message_id,
+    )
+
+    from bot.config import MASTER_CHAT_ID
+    client_ref = (
+        f"@{message.from_user.username}" if message.from_user.username
+        else f"id{message.from_user.id}"
+    )
+    caption = message.caption or ""
+    full_caption = f"📷 Фото к заявке №{order.id} от {client_ref}"
+    if caption:
+        full_caption += f"\n\n{caption}"
+    try:
+        await message.bot.send_photo(
+            chat_id=MASTER_CHAT_ID, photo=file_id, caption=full_caption,
+        )
+    except Exception:
+        logger.exception("Не удалось переслать фото клиента (заявка #%s)", order.id)
+        await message.answer("Не удалось передать фото. Попробуйте ещё раз.")
+        return
+    await message.answer("Фото передано мастеру.")
 
 
 @router.message(Command("myorders"))

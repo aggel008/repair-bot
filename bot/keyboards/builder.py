@@ -15,6 +15,24 @@ def device_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def photos_skip_keyboard() -> ReplyKeyboardMarkup:
+    """До загрузки первого фото."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📎 Без фото")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def photos_done_keyboard() -> ReplyKeyboardMarkup:
+    """После хотя бы одного фото."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="✅ Готово")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
 def phone_keyboard() -> ReplyKeyboardMarkup:
     """Клавиатура шага «телефон»: кнопка отправки контакта + ввод вручную."""
     return ReplyKeyboardMarkup(

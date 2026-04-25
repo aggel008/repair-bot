@@ -5,6 +5,7 @@ from typing import Awaitable, Callable, Optional, TypeVar
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNetworkError
+from aiogram.types import InputMediaPhoto
 
 from bot.config import MASTER_CHAT_ID, DEVICE_LABELS
 from bot.keyboards.inline import order_action_keyboard
@@ -47,6 +48,7 @@ async def notify_master_new_order(
     phone: str,
     user_id: int,
     username: Optional[str],
+    photo_ids: Optional[list[str]] = None,
 ) -> bool:
     """Отправляет мастеру уведомление о новой заявке + сам voice, если есть.
 
@@ -75,6 +77,14 @@ async def notify_master_new_order(
                 voice=voice_id,
                 caption=f"🎤 Голосовое к заявке #{order_id}",
             ))
+        if photo_ids:
+            # Telegram-альбом: до 10 фото за один send_media_group
+            for chunk_start in range(0, len(photo_ids), 10):
+                chunk = photo_ids[chunk_start:chunk_start + 10]
+                media = [InputMediaPhoto(media=fid) for fid in chunk]
+                await _with_retry(lambda m=media: bot.send_media_group(
+                    chat_id=MASTER_CHAT_ID, media=m,
+                ))
         return True
     except TelegramAPIError:
         logger.exception("Не удалось уведомить мастера о заявке #%s", order_id)

@@ -170,6 +170,25 @@ async def list_user_orders(user_id: int, limit: int = 10) -> list[Order]:
 
 # --- Сообщения переписки ---
 
+async def add_order_photo(order_id: int, file_id: str) -> None:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "INSERT INTO order_photos (order_id, file_id) VALUES (?, ?)",
+            (order_id, file_id),
+        )
+        await db.commit()
+
+
+async def get_order_photos(order_id: int) -> list[str]:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            "SELECT file_id FROM order_photos WHERE order_id = ? ORDER BY id",
+            (order_id,),
+        )
+        rows = await cursor.fetchall()
+        return [r[0] for r in rows]
+
+
 async def log_message(
     order_id: int,
     direction: str,  # 'client_to_master' | 'master_to_client'
