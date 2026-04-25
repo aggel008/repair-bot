@@ -15,13 +15,21 @@ def device_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def phone_keyboard() -> ReplyKeyboardMarkup:
+    """Клавиатура шага «телефон»: кнопка отправки контакта + ввод вручную."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Отправить мой контакт", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+        input_field_placeholder="или введите номер вручную",
+    )
+
+
 def confirm_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [
-                KeyboardButton(text="Подтвердить"),
-                KeyboardButton(text="Отмена"),
-            ]
+            [KeyboardButton(text="Подтвердить")],
+            [KeyboardButton(text="Изменить"), KeyboardButton(text="Отмена")],
         ],
         resize_keyboard=True,
         one_time_keyboard=True,

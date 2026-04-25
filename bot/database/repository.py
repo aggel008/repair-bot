@@ -53,3 +53,21 @@ async def update_status(order_id: int, status: str) -> None:
             "UPDATE orders SET status = ? WHERE id = ?", (status, order_id)
         )
         await db.commit()
+
+
+async def get_latest_open_order_by_user(user_id: int) -> Optional[Order]:
+    """Последняя заявка клиента, которая ещё не закрыта/не отменена."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT * FROM orders
+            WHERE user_id = ? AND status NOT IN ('done', 'cancelled')
+            ORDER BY id DESC LIMIT 1
+            """,
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return Order(**dict(row))

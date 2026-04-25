@@ -1,5 +1,4 @@
 import logging
-import re
 
 from aiogram import Router, F
 from aiogram.types import Message
@@ -8,11 +7,22 @@ from aiogram.fsm.context import FSMContext
 
 from bot.config import DEVICE_LABELS
 from bot.states.order import OrderForm
-from bot.keyboards.builder import device_keyboard, confirm_keyboard, remove_keyboard
-from bot.database.repository import create_order
-from bot.services.notification import notify_master_new_order
+from bot.keyboards.builder import (
+    device_keyboard,
+    phone_keyboard,
+    confirm_keyboard,
+    remove_keyboard,
+)
+from bot.database.repository import create_order, get_latest_open_order_by_user
+from bot.services.notification import (
+    notify_master_new_order,
+    forward_client_message_to_master,
+)
+from bot.utils.phone import normalize_phone
 
-router = Router()
+logger = logging.getLogger(__name__)
+
+router = Router(name="client")
 
 DEVICE_MAP = {
     "Телефон": "phone",
@@ -20,25 +30,28 @@ DEVICE_MAP = {
     "Планшет": "tablet",
 }
 
-PHONE_RE = re.compile(r"^[\+\d][\d\s\-\(\)]{6,14}\d$")
 
+# --- /start ---
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
-        "Привет! Это сервис по ремонту цифровой техники.\n\n"
+        "Здравствуйте! Опишем поломку за минуту.\n\n"
         "Выберите тип устройства:",
         reply_markup=device_keyboard(),
     )
     await state.set_state(OrderForm.device)
 
 
+# --- Шаг 1: устройство ---
+
 @router.message(OrderForm.device, F.text.in_(DEVICE_MAP))
 async def handle_device(message: Message, state: FSMContext) -> None:
     await state.update_data(device=DEVICE_MAP[message.text])
     await message.answer(
-        "Опишите проблему. Можно написать текстом или отправить голосовое сообщение.",
+        "Опишите проблему — текстом или голосовым сообщением.\n"
+        "Например: «не включается после падения, экран чёрный».",
         reply_markup=remove_keyboard(),
     )
     await state.set_state(OrderForm.problem)
@@ -46,59 +59,88 @@ async def handle_device(message: Message, state: FSMContext) -> None:
 
 @router.message(OrderForm.device)
 async def handle_device_invalid(message: Message) -> None:
-    await message.answer("Пожалуйста, выберите устройство из предложенных вариантов.")
+    await message.answer(
+        "Пожалуйста, выберите устройство кнопкой ниже."
+    )
 
+
+# --- Шаг 2: проблема ---
 
 @router.message(OrderForm.problem, F.text)
 async def handle_problem_text(message: Message, state: FSMContext) -> None:
-    if len(message.text.strip()) < 5:
-        await message.answer("Опишите проблему подробнее (минимум 5 символов).")
+    text = message.text.strip()
+    if len(text) < 5:
+        await message.answer(
+            "Опишите чуть подробнее — что не работает и когда началось."
+        )
         return
-    await state.update_data(problem=message.text.strip(), voice_id=None)
-    await message.answer("Укажите ваш номер телефона для связи:")
+    await state.update_data(problem=text, voice_id=None)
+    await message.answer(
+        "Как с вами связаться? Нажмите кнопку или введите номер вручную.",
+        reply_markup=phone_keyboard(),
+    )
     await state.set_state(OrderForm.phone)
 
 
 @router.message(OrderForm.problem, F.voice)
 async def handle_problem_voice(message: Message, state: FSMContext) -> None:
-    # Сохраняем file_id голосового — мастер получит пометку о голосовом сообщении
     await state.update_data(
         problem="[голосовое сообщение]",
         voice_id=message.voice.file_id,
     )
-    await message.answer("Голосовое принято. Укажите ваш номер телефона для связи:")
+    await message.answer(
+        "Голосовое принято. Как с вами связаться?",
+        reply_markup=phone_keyboard(),
+    )
     await state.set_state(OrderForm.phone)
 
 
 @router.message(OrderForm.problem)
 async def handle_problem_invalid(message: Message) -> None:
-    await message.answer("Отправьте текст или голосовое сообщение с описанием проблемы.")
+    await message.answer("Отправьте текст или голосовое с описанием проблемы.")
+
+
+# --- Шаг 3: телефон ---
+
+@router.message(OrderForm.phone, F.contact)
+async def handle_phone_contact(message: Message, state: FSMContext) -> None:
+    """Принимаем контакт через кнопку — не валидируем regex'ом."""
+    phone = normalize_phone(message.contact.phone_number) or message.contact.phone_number
+    await _ask_confirmation(message, state, phone)
 
 
 @router.message(OrderForm.phone, F.text)
-async def handle_phone(message: Message, state: FSMContext) -> None:
-    phone = message.text.strip()
-    if not PHONE_RE.match(phone):
+async def handle_phone_text(message: Message, state: FSMContext) -> None:
+    phone = normalize_phone(message.text)
+    if phone is None:
         await message.answer(
-            "Введите корректный номер телефона, например: +79001234567"
+            "Не похоже на номер. Пример: +79001234567 "
+            "или нажмите кнопку «📱 Отправить мой контакт»."
         )
         return
+    await _ask_confirmation(message, state, phone)
 
+
+@router.message(OrderForm.phone)
+async def handle_phone_invalid(message: Message) -> None:
+    await message.answer(
+        "Отправьте номер текстом или нажмите кнопку «📱 Отправить мой контакт»."
+    )
+
+
+async def _ask_confirmation(message: Message, state: FSMContext, phone: str) -> None:
     data = await state.get_data()
     await state.update_data(phone=phone)
 
     device_label = DEVICE_LABELS[data["device"]]
-    problem_text = data["problem"]
-    has_voice = data.get("voice_id") is not None
+    voice_mark = " (+ голосовое)" if data.get("voice_id") else ""
 
     summary = (
-        f"Ваша заявка:\n\n"
+        f"Проверьте заявку:\n\n"
         f"Устройство: {device_label}\n"
-        f"Проблема: {problem_text}"
-        + (" (+ голосовое сообщение)" if has_voice else "")
-        + f"\nТелефон: {phone}"
+        f"Проблема: {data['problem']}{voice_mark}\n"
+        f"Телефон: {phone}"
     )
-
     await message.answer(
         summary + "\n\nВсё верно?",
         reply_markup=confirm_keyboard(),
@@ -106,10 +148,7 @@ async def handle_phone(message: Message, state: FSMContext) -> None:
     await state.set_state(OrderForm.confirm)
 
 
-@router.message(OrderForm.phone)
-async def handle_phone_invalid(message: Message) -> None:
-    await message.answer("Введите номер телефона текстом, например: +79001234567")
-
+# --- Шаг 4: подтверждение ---
 
 @router.message(OrderForm.confirm, F.text == "Подтвердить")
 async def handle_confirm(message: Message, state: FSMContext) -> None:
@@ -126,8 +165,8 @@ async def handle_confirm(message: Message, state: FSMContext) -> None:
     )
 
     await message.answer(
-        f"Заявка #{order_id} принята!\n"
-        "Мастер свяжется с вами по указанному номеру телефона.",
+        f"Заявка №{order_id} принята.\n"
+        "Мастер ответит здесь же. Можно дописать в этот чат — всё уйдёт мастеру.",
         reply_markup=remove_keyboard(),
     )
 
@@ -142,10 +181,18 @@ async def handle_confirm(message: Message, state: FSMContext) -> None:
         username=message.from_user.username,
     )
     if not notified:
-        # Заявка сохранена, но мастер не получил уведомление — не теряем её
-        logging.getLogger(__name__).error(
-            "Заявка #%s сохранена, но мастер не уведомлён", order_id
-        )
+        logger.error("Заявка #%s сохранена, но мастер не уведомлён", order_id)
+
+
+@router.message(OrderForm.confirm, F.text == "Изменить")
+async def handle_edit(message: Message, state: FSMContext) -> None:
+    """Сбрасываем заполненные данные, начинаем заново с шага устройства."""
+    await state.clear()
+    await message.answer(
+        "Хорошо, начнём заново. Выберите устройство:",
+        reply_markup=device_keyboard(),
+    )
+    await state.set_state(OrderForm.device)
 
 
 @router.message(OrderForm.confirm, F.text == "Отмена")
@@ -159,13 +206,33 @@ async def handle_cancel(message: Message, state: FSMContext) -> None:
 
 @router.message(OrderForm.confirm)
 async def handle_confirm_invalid(message: Message) -> None:
-    await message.answer('Нажмите "Подтвердить" или "Отмена".')
+    await message.answer('Нажмите «Подтвердить», «Изменить» или «Отмена».')
+
+
+# --- Fallback вне FSM: пересылаем мастеру через bridge ---
+
+@router.message(F.text)
+async def fallback_text(message: Message) -> None:
+    """Клиент пишет текст вне FSM — ищем его открытую заявку и пересылаем мастеру."""
+    order = await get_latest_open_order_by_user(message.from_user.id)
+    if order is None:
+        await message.answer(
+            "Чтобы создать заявку — /start.\nСписок команд — /help."
+        )
+        return
+
+    await forward_client_message_to_master(
+        bot=message.bot,
+        order_id=order.id,
+        text=message.text,
+        username=message.from_user.username,
+        user_id=message.from_user.id,
+    )
+    await message.answer("Сообщение передано мастеру.")
 
 
 @router.message()
-async def fallback(message: Message) -> None:
-    """Сообщение вне любого FSM-состояния — подсказываем, что делать."""
+async def fallback_other(message: Message) -> None:
     await message.answer(
-        "Чтобы создать заявку — /start.\n"
-        "Список команд — /help."
+        "Чтобы создать заявку — /start.\nСписок команд — /help."
     )
