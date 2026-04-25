@@ -6,11 +6,14 @@
 import logging
 
 from aiogram import Router, F
+from aiogram.filters import BaseFilter
 from aiogram.types import Message, CallbackQuery
 
 from bot.config import MASTER_CHAT_ID
 from bot.database.repository import (
     get_order,
+    get_order_by_notification_msg,
+    get_order_by_topic_id,
     list_open_orders,
     log_message,
     update_status,
@@ -26,6 +29,13 @@ router = Router(name="master")
 # Закрытие security-дыры: все хендлеры этого роутера сработают только в чате мастера.
 router.message.filter(F.chat.id == MASTER_CHAT_ID)
 router.callback_query.filter(F.message.chat.id == MASTER_CHAT_ID)
+
+
+class BridgeActive(BaseFilter):
+    """Матчится только если у мастера есть активный диалог. Иначе — пропуск
+    события дальше по цепочке роутеров (например, в client для /start)."""
+    async def __call__(self, message: Message) -> bool:
+        return bridge.get_active() is not None
 
 
 # --- Callback-кнопки на уведомлении ---
@@ -121,28 +131,8 @@ async def cmd_done(message: Message) -> None:
     await message.answer("Вы вышли из диалога.")
 
 
-@router.message(F.text)
-async def handle_master_text(message: Message) -> None:
-    """Текст от мастера → клиенту активной заявки.
-
-    Игнорируем команды (начинаются с /) — их разруливают другие хендлеры.
-    """
-    if message.text.startswith("/"):
-        return  # пусть проваливается дальше — другие хендлеры обработают
-
-    active_id = bridge.get_active()
-    if active_id is None:
-        await message.answer(
-            "Чтобы ответить клиенту, нажмите «💬 Ответить» под нужной заявкой."
-        )
-        return
-
-    order = await get_order(active_id)
-    if order is None:
-        bridge.clear_active()
-        await message.answer("Заявка пропала из БД. Диалог закрыт.")
-        return
-
+async def _deliver_to_client(message: Message, order) -> None:
+    """Общая логика доставки текста мастера → клиенту с логированием."""
     try:
         await message.bot.send_message(
             chat_id=order.user_id,
@@ -159,10 +149,63 @@ async def handle_master_text(message: Message) -> None:
                 order.id, OrderStatus.IN_PROGRESS.value,
                 actor="master", actor_id=message.from_user.id,
             )
-        await message.answer(f"✓ доставлено клиенту (заявка №{order.id})")
+        await message.reply(f"✓ доставлено клиенту (заявка №{order.id})")
     except Exception:
         logger.exception("Ответ клиенту по заявке #%s не доставлен", order.id)
-        await message.answer(
+        await message.reply(
             "Не удалось доставить сообщение клиенту "
             "(возможно, бот заблокирован)."
         )
+
+
+class IsReplyToOrderNotification(BaseFilter):
+    """Матчится только если сообщение — reply на корневое уведомление заявки."""
+    async def __call__(self, message: Message) -> bool:
+        if message.reply_to_message is None:
+            return False
+        order = await get_order_by_notification_msg(message.reply_to_message.message_id)
+        return order is not None
+
+
+class IsInOrderTopic(BaseFilter):
+    """Матчится, если сообщение в топике форума, привязанном к заявке."""
+    async def __call__(self, message: Message) -> bool:
+        if message.message_thread_id is None:
+            return False
+        order = await get_order_by_topic_id(message.message_thread_id)
+        return order is not None
+
+
+@router.message(F.text & ~F.text.startswith("/"), IsInOrderTopic())
+async def handle_master_in_topic(message: Message) -> None:
+    """В форум-режиме: мастер пишет в топике заявки → клиенту этой заявки.
+
+    Никаких кнопок «Ответить» не нужно — топик сам определяет контекст.
+    """
+    order = await get_order_by_topic_id(message.message_thread_id)
+    if order is None:
+        return
+    bridge.set_active(order.id)
+    await _deliver_to_client(message, order)
+
+
+@router.message(F.text & ~F.text.startswith("/"), IsReplyToOrderNotification())
+async def handle_master_swipe_reply(message: Message) -> None:
+    """Не-форум: мастер свайп-реплаит на уведомление → клиенту этой заявки."""
+    order = await get_order_by_notification_msg(message.reply_to_message.message_id)
+    if order is None:
+        return
+    bridge.set_active(order.id)
+    await _deliver_to_client(message, order)
+
+
+@router.message(F.text & ~F.text.startswith("/"), BridgeActive())
+async def handle_master_text(message: Message) -> None:
+    """Текст от мастера (без свайп-реплая, при активном bridge) → клиенту."""
+    active_id = bridge.get_active()
+    order = await get_order(active_id) if active_id else None
+    if order is None:
+        bridge.clear_active()
+        await message.reply("Заявка пропала из БД. Диалог закрыт.")
+        return
+    await _deliver_to_client(message, order)

@@ -23,7 +23,10 @@ class Order:
     phone: str
     status: str
     created_at: str
-    updated_at: Optional[str] = None  # появилось в миграции 0002
+    updated_at: Optional[str] = None              # появилось в миграции 0002
+    device_model: Optional[str] = None            # появилось в миграции 0004
+    notification_message_id: Optional[int] = None # появилось в миграции 0004
+    topic_id: Optional[int] = None                # появилось в миграции 0005
 
 
 def _row_to_order(row: aiosqlite.Row) -> Order:
@@ -39,6 +42,7 @@ async def create_order(
     user_id: int,
     username: Optional[str],
     device_type: str,
+    device_model: Optional[str],
     problem: str,
     phone: str,
     voice_id: Optional[str] = None,
@@ -46,10 +50,11 @@ async def create_order(
     async with aiosqlite.connect(DATABASE_PATH) as db:
         cursor = await db.execute(
             """
-            INSERT INTO orders (user_id, username, device_type, problem, voice_id, phone)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO orders
+                (user_id, username, device_type, device_model, problem, voice_id, phone)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, username, device_type, problem, voice_id, phone),
+            (user_id, username, device_type, device_model, problem, voice_id, phone),
         )
         order_id = cursor.lastrowid
         await db.execute(
@@ -61,6 +66,49 @@ async def create_order(
         )
         await db.commit()
         return order_id
+
+
+async def set_notification_message_id(order_id: int, message_id: int) -> None:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "UPDATE orders SET notification_message_id = ? WHERE id = ?",
+            (message_id, order_id),
+        )
+        await db.commit()
+
+
+async def set_topic_id(order_id: int, topic_id: int) -> None:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "UPDATE orders SET topic_id = ? WHERE id = ?",
+            (topic_id, order_id),
+        )
+        await db.commit()
+
+
+async def get_order_by_topic_id(topic_id: int) -> Optional[Order]:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM orders WHERE topic_id = ? LIMIT 1", (topic_id,)
+        )
+        row = await cursor.fetchone()
+        return _row_to_order(row) if row else None
+
+
+async def get_order_by_notification_msg(message_id: int) -> Optional[Order]:
+    """Найти заявку по message_id её корневого уведомления у мастера.
+
+    Используется, когда мастер свайп-реплаит на старое уведомление.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM orders WHERE notification_message_id = ? LIMIT 1",
+            (message_id,),
+        )
+        row = await cursor.fetchone()
+        return _row_to_order(row) if row else None
 
 
 async def find_recent_duplicate(

@@ -27,12 +27,17 @@ class ThrottlingMiddleware(BaseMiddleware):
         if event.from_user is None:
             return await handler(event, data)
 
+        # Сообщения, входящие в один альбом (media_group_id), приходят
+        # отдельными апдейтами с интервалом ~50мс. Их нельзя резать throttle'ом —
+        # иначе клиент шлёт 3 фото, а до бота доходит только первое.
+        if event.media_group_id is not None:
+            return await handler(event, data)
+
         user_id = event.from_user.id
         now = time.monotonic()
         last = self._last_call.get(user_id, 0)
 
         if now - last < self.rate_limit:
-            # Сбрасываем флуд без ответа — иначе бот сам станет источником шума
             return None
 
         self._last_call[user_id] = now

@@ -9,6 +9,7 @@ from bot.config import BOT_TOKEN, MASTER_CHAT_ID
 from bot.database.db import init_db
 from bot.handlers import client, master, common
 from bot.middlewares.throttling import ThrottlingMiddleware
+from bot.services.notification import init_chat_mode
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +58,7 @@ async def main() -> None:
     dp.errors.register(common.on_error)
 
     await _startup_check(bot)
+    await init_chat_mode(bot)
     logger.info("Бот запускается...")
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 

@@ -26,7 +26,9 @@ from bot.database.repository import (
 from bot.services.notification import (
     notify_master_new_order,
     forward_client_message_to_master,
+    forward_client_photo_to_master,
 )
+from bot.database.repository import set_notification_message_id, set_topic_id
 from bot.utils.phone import normalize_phone
 
 logger = logging.getLogger(__name__)
@@ -46,24 +48,28 @@ DEVICE_MAP = {
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
-        "Здравствуйте! Опишем поломку за минуту.\n\n"
-        "Выберите тип устройства:",
+        "Здравствуйте. Составим заявку на ремонт.\n\n"
+        "Какое у вас устройство?",
         reply_markup=device_keyboard(),
     )
     await state.set_state(OrderForm.device)
 
 
-# --- Шаг 1: устройство ---
+# --- Шаг 1: тип устройства ---
 
 @router.message(OrderForm.device, F.text.in_(DEVICE_MAP))
 async def handle_device(message: Message, state: FSMContext) -> None:
     await state.update_data(device=DEVICE_MAP[message.text])
+    examples = {
+        "phone": "iPhone 13 Pro, Samsung S22, Xiaomi Redmi 12",
+        "laptop": "MacBook Air M2, Lenovo ThinkPad X1, ASUS ZenBook",
+        "tablet": "iPad Pro 11, Samsung Tab S9, Huawei MatePad",
+    }[DEVICE_MAP[message.text]]
     await message.answer(
-        "Опишите проблему — текстом или голосовым сообщением.\n"
-        "Например: «не включается после падения, экран чёрный».",
+        f"Укажите модель устройства.\nНапример: {examples}",
         reply_markup=remove_keyboard(),
     )
-    await state.set_state(OrderForm.problem)
+    await state.set_state(OrderForm.model)
 
 
 @router.message(OrderForm.device)
@@ -71,6 +77,30 @@ async def handle_device_invalid(message: Message) -> None:
     await message.answer(
         "Пожалуйста, выберите устройство кнопкой ниже."
     )
+
+
+# --- Шаг 1.5: модель устройства ---
+
+@router.message(OrderForm.model, F.text)
+async def handle_model(message: Message, state: FSMContext) -> None:
+    model = message.text.strip()
+    if len(model) < 2:
+        await message.answer("Напишите модель — хотя бы пару символов.")
+        return
+    if len(model) > 100:
+        await message.answer("Слишком длинно. Уложитесь в 100 символов.")
+        return
+    await state.update_data(model=model)
+    await message.answer(
+        "Опишите проблему — текстом или голосовым сообщением.\n"
+        "Например: «не включается после падения, экран чёрный».",
+    )
+    await state.set_state(OrderForm.problem)
+
+
+@router.message(OrderForm.model)
+async def handle_model_invalid(message: Message) -> None:
+    await message.answer("Напишите модель устройства текстом.")
 
 
 # --- Шаг 2: проблема ---
@@ -175,6 +205,7 @@ async def _ask_confirmation(message: Message, state: FSMContext, phone: str) -> 
     await state.update_data(phone=phone)
 
     device_label = DEVICE_LABELS[data["device"]]
+    model = data.get("model") or "—"
     voice_mark = " (+ голосовое)" if data.get("voice_id") else ""
     photos_count = len(data.get("photo_ids") or [])
     photos_mark = f"\nФото: {photos_count}" if photos_count else ""
@@ -182,6 +213,7 @@ async def _ask_confirmation(message: Message, state: FSMContext, phone: str) -> 
     summary = (
         f"Проверьте заявку:\n\n"
         f"Устройство: {device_label}\n"
+        f"Модель: {model}\n"
         f"Проблема: {data['problem']}{voice_mark}{photos_mark}\n"
         f"Телефон: {phone}"
     )
@@ -217,6 +249,7 @@ async def handle_confirm(message: Message, state: FSMContext) -> None:
         user_id=message.from_user.id,
         username=message.from_user.username,
         device_type=data["device"],
+        device_model=data.get("model"),
         problem=data["problem"],
         phone=data["phone"],
         voice_id=data.get("voice_id"),
@@ -231,10 +264,11 @@ async def handle_confirm(message: Message, state: FSMContext) -> None:
         reply_markup=remove_keyboard(),
     )
 
-    notified = await notify_master_new_order(
+    root_msg_id, topic_id = await notify_master_new_order(
         bot=message.bot,
         order_id=order_id,
         device_type=data["device"],
+        device_model=data.get("model"),
         problem=data["problem"],
         voice_id=data.get("voice_id"),
         phone=data["phone"],
@@ -242,8 +276,12 @@ async def handle_confirm(message: Message, state: FSMContext) -> None:
         username=message.from_user.username,
         photo_ids=photo_ids,
     )
-    if not notified:
+    if root_msg_id is None:
         logger.error("Заявка #%s сохранена, но мастер не уведомлён", order_id)
+    else:
+        await set_notification_message_id(order_id, root_msg_id)
+    if topic_id is not None:
+        await set_topic_id(order_id, topic_id)
 
 
 @router.message(OrderForm.confirm, F.text == "Изменить")
@@ -289,6 +327,8 @@ async def fallback_text(message: Message) -> None:
         text=message.text,
         username=message.from_user.username,
         user_id=message.from_user.id,
+        notification_message_id=order.notification_message_id,
+        topic_id=order.topic_id,
     )
     await log_message(
         order_id=order.id,
@@ -318,23 +358,16 @@ async def fallback_photo(message: Message) -> None:
         tg_msg_id=message.message_id,
     )
 
-    from bot.config import MASTER_CHAT_ID
-    client_ref = (
-        f"@{message.from_user.username}" if message.from_user.username
-        else f"id{message.from_user.id}"
+    await forward_client_photo_to_master(
+        bot=message.bot,
+        order_id=order.id,
+        photo_file_id=file_id,
+        caption=message.caption,
+        username=message.from_user.username,
+        user_id=message.from_user.id,
+        notification_message_id=order.notification_message_id,
+        topic_id=order.topic_id,
     )
-    caption = message.caption or ""
-    full_caption = f"📷 Фото к заявке №{order.id} от {client_ref}"
-    if caption:
-        full_caption += f"\n\n{caption}"
-    try:
-        await message.bot.send_photo(
-            chat_id=MASTER_CHAT_ID, photo=file_id, caption=full_caption,
-        )
-    except Exception:
-        logger.exception("Не удалось переслать фото клиента (заявка #%s)", order.id)
-        await message.answer("Не удалось передать фото. Попробуйте ещё раз.")
-        return
     await message.answer("Фото передано мастеру.")
 
 
