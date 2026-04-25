@@ -2,7 +2,7 @@ import logging
 
 from aiogram import Router, F
 from aiogram.types import Message
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 
 from bot.config import DEVICE_LABELS
@@ -17,6 +17,8 @@ from bot.database.repository import (
     create_order,
     find_recent_duplicate,
     get_latest_open_order_by_user,
+    list_user_orders,
+    log_message,
 )
 from bot.services.notification import (
     notify_master_new_order,
@@ -246,7 +248,26 @@ async def fallback_text(message: Message) -> None:
         username=message.from_user.username,
         user_id=message.from_user.id,
     )
+    await log_message(
+        order_id=order.id,
+        direction="client_to_master",
+        text=message.text,
+        tg_msg_id=message.message_id,
+    )
     await message.answer("Сообщение передано мастеру.")
+
+
+@router.message(Command("myorders"))
+async def cmd_myorders(message: Message) -> None:
+    orders = await list_user_orders(message.from_user.id, limit=10)
+    if not orders:
+        await message.answer("У вас пока нет заявок. Создать — /start")
+        return
+    lines = ["Ваши заявки:"]
+    for o in orders:
+        device = DEVICE_LABELS.get(o.device_type, o.device_type)
+        lines.append(f"№{o.id} · {device} · {o.status}")
+    await message.answer("\n".join(lines))
 
 
 @router.message()

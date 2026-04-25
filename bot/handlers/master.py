@@ -9,7 +9,13 @@ from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 
 from bot.config import MASTER_CHAT_ID
-from bot.database.repository import get_order, update_status
+from bot.database.repository import (
+    get_order,
+    list_open_orders,
+    log_message,
+    update_status,
+)
+from bot.domain.enums import OrderStatus
 from bot.keyboards.inline import OrderAction, order_action_keyboard
 from bot.services import bridge
 from bot.services.notification import notify_client_status
@@ -50,13 +56,15 @@ async def cb_progress(query: CallbackQuery, callback_data: OrderAction) -> None:
         await query.answer("Заявка не найдена", show_alert=True)
         return
 
-    await update_status(order.id, "in_progress")
-    await notify_client_status(query.bot, order.user_id, order.id, "in_progress")
+    await update_status(
+        order.id, OrderStatus.IN_PROGRESS.value,
+        actor="master", actor_id=query.from_user.id,
+    )
+    await notify_client_status(query.bot, order.user_id, order.id, OrderStatus.IN_PROGRESS.value)
     await query.answer("Статус → в работе")
-    # Обновляем клавиатуру под новый статус
     try:
         await query.message.edit_reply_markup(
-            reply_markup=order_action_keyboard(order.id, status="in_progress")
+            reply_markup=order_action_keyboard(order.id, status=OrderStatus.IN_PROGRESS.value)
         )
     except Exception:
         pass
@@ -69,17 +77,37 @@ async def cb_close(query: CallbackQuery, callback_data: OrderAction) -> None:
         await query.answer("Заявка не найдена", show_alert=True)
         return
 
-    await update_status(order.id, "done")
-    await notify_client_status(query.bot, order.user_id, order.id, "done")
+    await update_status(
+        order.id, OrderStatus.DONE.value,
+        actor="master", actor_id=query.from_user.id,
+    )
+    await notify_client_status(query.bot, order.user_id, order.id, OrderStatus.DONE.value)
     if bridge.get_active() == order.id:
         bridge.clear_active()
     await query.answer("Заявка закрыта")
     try:
         await query.message.edit_reply_markup(
-            reply_markup=order_action_keyboard(order.id, status="done")
+            reply_markup=order_action_keyboard(order.id, status=OrderStatus.DONE.value)
         )
     except Exception:
         pass
+
+
+@router.message(F.text == "/orders")
+async def cmd_orders(message: Message) -> None:
+    """Список открытых заявок для мастера."""
+    orders = await list_open_orders(limit=20)
+    if not orders:
+        await message.answer("Открытых заявок нет.")
+        return
+    lines = ["Открытые заявки:"]
+    for o in orders:
+        client = f"@{o.username}" if o.username else f"id{o.user_id}"
+        lines.append(
+            f"№{o.id} · {o.device_type} · {o.status} · {o.phone} · {client}"
+        )
+    lines.append("\nЧтобы ответить — откройте уведомление с кнопками.")
+    await message.answer("\n".join(lines))
 
 
 # --- Команды и текст мастера ---
@@ -120,8 +148,17 @@ async def handle_master_text(message: Message) -> None:
             chat_id=order.user_id,
             text=f"💬 Ответ мастера по заявке №{order.id}:\n\n{message.text}",
         )
-        if order.status == "new":
-            await update_status(order.id, "in_progress")
+        await log_message(
+            order_id=order.id,
+            direction="master_to_client",
+            text=message.text,
+            tg_msg_id=message.message_id,
+        )
+        if order.status == OrderStatus.NEW.value:
+            await update_status(
+                order.id, OrderStatus.IN_PROGRESS.value,
+                actor="master", actor_id=message.from_user.id,
+            )
         await message.answer(f"✓ доставлено клиенту (заявка №{order.id})")
     except Exception:
         logger.exception("Ответ клиенту по заявке #%s не доставлен", order.id)
